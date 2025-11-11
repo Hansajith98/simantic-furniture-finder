@@ -1,0 +1,45 @@
+version: '3.9'
+
+services:
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: django_user
+      POSTGRES_PASSWORD: django_pass
+      POSTGRES_DB: django_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backups/postgres/:/var/lib/postgresql/
+    networks:
+      - chatbot-network
+    ports:
+      - "5432:5432"
+
+  web:
+    build: furniturefinder/.
+    command: python manage.py runserver 0.0.0.0:8000
+    volumes:
+      - ./furniturefinder:/app/
+      - /VolumeMaps/logs/furniturefinder/dev:/app/logs
+      - /VolumeMaps/data/furniturefinder/images:/app/data
+      - /VolumeMaps/downloaded_files:/app/downloaded_files
+    ports:
+      - "5000:8000"
+    depends_on:
+      - db
+    environment:
+      - DATABASE_NAME=django_db
+      - DATABASE_USER=django_user
+      - DATABASE_PASSWORD=django_pass
+      - DATABASE_HOST=db
+      - DATABASE_PORT=5432
+    networks:
+      - chatbot-network
+
+networks:
+  chatbot-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
