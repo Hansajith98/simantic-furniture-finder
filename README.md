@@ -29,7 +29,7 @@ By converting images into **semantic vectors** and comparing their meanings (not
 
 ## 🧠 System Architecture
 
-![System Architecture](./SymanticFurnitureFinder _251112_110352_0.png)
+![System Architecture](./Project Documents/architecture.png)
 
 ### Components:
 - **Front End:**  
