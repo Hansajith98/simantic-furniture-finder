@@ -29,7 +29,7 @@ By converting images into **semantic vectors** and comparing their meanings (not
 
 ## 🧠 System Architecture
 
-![System Architecture](./Project Documents/architecture.png)
+![System Architecture](./Project%20Documents/architecture.png)
 
 ### Components:
 - **Front End:**  
@@ -57,7 +57,7 @@ By converting images into **semantic vectors** and comparing their meanings (not
 
 ## 📜 Project Explanation
 
-![Project Scenario](./SymanticFurnitureFinder _251112_110352_1.png)
+![Project Scenario](./Project%20Documents/scenario.png)
 
 ---
 

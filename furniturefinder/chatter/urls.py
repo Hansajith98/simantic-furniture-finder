@@ -1,8 +1,9 @@
 from django.urls import path
-from . import views
+from .views import ChatterView
 
 app_name = 'chatter'
 
 urlpatterns = [
-    path('', views.index, name='index'),
+    path('chat/', ChatterView.as_view(), name='chat'),
+    path('', ChatterView.as_view(), name='index'),
 ]

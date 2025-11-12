@@ -2,7 +2,6 @@ import asyncio
 import string
 import json
 import logging
-from logging import Logger
 import base64
 from datetime import datetime
 from random import choices
@@ -11,271 +10,168 @@ from tabulate import tabulate
 from PIL import Image
 from configparser import ConfigParser
 
-from chatter.models import ChatMessage, Agent
+from chatter.models import ChatMessage
 from organization.utils import log_execution_time
-from external_services.weaviate_services import WeaviateServices
-
-config = ConfigParser()
-config.read('conf/application.ini')
-
-IMAGE_DESCRIPTOR_MODEL = config['OpenAI']['image_descriptor_model']
-MAX_TOKENS = int(config['OpenAI']['image_description_max_tokens'])
-TEMPERATURE = float(config['OpenAI']['image_description_temperature'])
-SEED = int(config['OpenAI']['image_description_seed'])
-
-WEAVIATE_RESULT_LIMIT = config['Weaviate']['result_limit']
-RESIZING_RESOLUTION = (512, 768)
-
-DEFAULT_TEXT_EMBEDDING_MODEL = config['OpenAI']['text_embedding_model']
+from external_services.weaviate_services import WeaviateHandler 
 
 
-class ImageRetriever:
+cfg = ConfigParser()
+cfg.read("conf/application.ini")
 
-    def __init__(self, prompt, resizing_resolution=RESIZING_RESOLUTION,
-                 image_directory='data', descriptor_model=IMAGE_DESCRIPTOR_MODEL,
-                 logger=None, embedding_model=DEFAULT_TEXT_EMBEDDING_MODEL):
+IMG_DESC_MODEL = cfg["OpenAI"]["image_descriptor_model"]
+DESC_MAX_TOKENS = int(cfg["OpenAI"]["image_description_max_tokens"])
+DESC_TEMP = float(cfg["OpenAI"]["image_description_temperature"])
+DESC_SEED = int(cfg["OpenAI"]["image_description_seed"])
 
-        self.__prompt = prompt
-        self.__resizing_resolution = resizing_resolution
+RESIZE_SHAPE = (512, 768)
+DEFAULT_EMBED_MODEL = cfg["OpenAI"]["text_embedding_model"]
 
-        self.__image_directory = image_directory
-        self.__descriptor_model = descriptor_model
-        self.__embedding_model = embedding_model
 
-        self.__max_shortlist_count = 7
+class ImageMatcher:
+    def __init__(
+        self,
+        base_prompt,
+        resize_shape=RESIZE_SHAPE,
+        save_path="data",
+        desc_model=IMG_DESC_MODEL,
+        logger=None,
+        embed_model=DEFAULT_EMBED_MODEL,
+    ):
+        self._prompt = base_prompt
+        self._resize_shape = resize_shape
+        self._save_path = save_path
+        self._desc_model = desc_model
+        self._embed_model = embed_model
 
-        self.__prompt_tokens = 0
-        self.__completion_tokens = 0
-        self.__total_tokens = 0
-        self.__model = ''
-        if not isinstance(logger, Logger):
-            self.__logger = logging.getLogger('chat_with_website')
-        else:
-            self.__logger = logger
+        self._shortlist_cap = 7
+        self._prompt_tokens = 0
+        self._completion_tokens = 0
+        self._total_tokens = 0
+        self._used_model = ""
 
-    def get_token_usage(self) -> dict:
-        '''
-        Return current Token Usage of Image Retriever
-        '''
+        self._log = logger if isinstance(logger, logging.Logger) else logging.getLogger("image_matcher")
+
+    def token_usage(self):
         return {
-            'prompt_tokens': self.__prompt_tokens,
-            'completion_tokens': self.__completion_tokens,
-            'total_tokens': self.__total_tokens,
-            'model': self.__model
+            "prompt_tokens": self._prompt_tokens,
+            "completion_tokens": self._completion_tokens,
+            "total_tokens": self._total_tokens,
+            "model": self._used_model,
         }
 
-    def download_image(self, message: ChatMessage) -> str:
-        '''
-        Downloads an image from specified URL and saves it to data folder
-        '''
+    def _download(self, chat_message: ChatMessage) -> str:
+        ts = datetime.strftime(chat_message.timestamp, "%Y%m%d_%H_%M_%S_%f")
+        rand_tag = "".join(choices(string.ascii_lowercase, k=5))
+        resp = requests.get(chat_message.image_url)
+        fname = f"{ts}_{rand_tag}.png"
+        with open(f"{self._save_path}/{fname}", "wb") as out_file:
+            out_file.write(resp.content)
+        return fname
 
-        timestamp_str = datetime.strftime(
-            message.timestamp, '%Y%m%d_%H_%M_%S_%f')
-        random_str = ''.join(choices(string.ascii_lowercase, k=5))
+    def _resize(self, tag: str, fname: str, shape: tuple = None) -> str:
+        shape = shape or self._resize_shape
+        with Image.open(f"{self._save_path}/{fname}") as img:
+            img.thumbnail(shape)
+            resized = f"{self._save_path}/r{fname}"
+            img.save(resized)
+        return resized
 
-        response = requests.get(message.image_url)
-        filename = f'{timestamp_str}_{random_str}.png'
+    def _parse_openai_json(self, api_response) -> dict:
+        parsed = {"name": "Target Furniture Item in Image", "url": "", "price": ""}
+        data_str = api_response.choices[0].message.content
+        for key, val in json.loads(data_str).items():
+            parsed[key] = val
+        return parsed
 
-        with open(f'{self.__image_directory}/{filename}', 'wb') as file:
-            file.write(response.content)
-
-            self.__logger.info(f'[{message.request_id}] - [{message.organization_id}] | '
-                               f'[{message.session_id}] | image_downloaded | {filename}')
-
-        return filename
-
-    def resize_image(self, log_str: str, filename: str,
-                     resizing_resolution: tuple = None) -> str:
-        '''
-        Resize image 
-        '''
-        if not resizing_resolution:
-            resizing_resolution = self.__resizing_resolution
-
-        with Image.open(f'{self.__image_directory}/{filename}') as image:
-            image.thumbnail(resizing_resolution)
-            resized_image_filename = f'{self.__image_directory}/r{filename}'
-            image.save(resized_image_filename)
-
-            self.__logger.info(f'{log_str} | image_resized | '
-                               f'{resized_image_filename}')
-
-        return resized_image_filename
-
-    def get_descriptors_from_json_response(self, response) -> str:
-        '''
-        Return Image Descriptor from OpenAI json response
-        '''
-        image_descriptors = {'name': 'Target Fashion Item in Image',
-                             'url': '', 'price': ''}
-        json_response_str = response.choices[0].message.content
-
-        for key, value in json.loads(json_response_str).items():
-            image_descriptors[key] = value
-
-        return image_descriptors
-
-    def get_image_descriptors(self, log_str: str, client: any,
-                              image_filename: str) -> dict:
-        '''
-        Get Image Descriptor from OpenAI
-        '''
-        with open(image_filename, 'rb') as file:
-            encoded_content = base64.b64encode(file.read()).decode('utf-8')
-            image_url = f'data:image/jpeg;base64,{encoded_content}'
+    def _describe_image(self, tag: str, client, img_file: str) -> dict:
+        with open(img_file, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("utf-8")
+        img_url = f"data:image/jpeg;base64,{encoded}"
 
         try:
-            response = client.chat.completions.create(
-                model=self.__descriptor_model,
+            res = client.chat.completions.create(
+                model=self._desc_model,
                 messages=[
-                    {'role': 'system', 'content': [
-                        {'type': 'text', 'text': self.__prompt}]},
-                    {'role': 'user', 'content': [
-                        {'type': 'image_url', 'image_url': {'url': image_url}}]}
-                ], response_format={'type': 'json_object'},
-                temperature=TEMPERATURE, max_tokens=MAX_TOKENS, seed=SEED
+                    {"role": "system", "content": [{"type": "text", "text": self._prompt}]},
+                    {"role": "user", "content": [{"type": "image_url", "image_url": {"url": img_url}}]},
+                ],
+                response_format={"type": "json_object"},
+                temperature=DESC_TEMP,
+                max_tokens=DESC_MAX_TOKENS,
+                seed=DESC_SEED,
             )
-            self.__prompt_tokens += response.usage.prompt_tokens
-            self.__completion_tokens += response.usage.completion_tokens
-            self.__total_tokens += response.usage.total_tokens
-            self.__model += response.model
+            self._prompt_tokens += res.usage.prompt_tokens
+            self._completion_tokens += res.usage.completion_tokens
+            self._total_tokens += res.usage.total_tokens
+            self._used_model += res.model
+        except Exception as err:
+            self._log.critical(f"{tag} | openai_image_description_failed", exc_info=True)
+            raise err
 
-        except Exception as error:
-            self.__logger.error(f'{log_str} | openai_error |', exc_info=True)
-            raise error
+        return self._parse_openai_json(res)
 
-        self.__logger.info(
-            f'{log_str} | image_description_received_from_openai')
-
-        image_descriptors = self.get_descriptors_from_json_response(response)
-
-        return image_descriptors
-
-    def get_embedding(self, log_str: str, client: any, descriptors: dict) -> dict:
-        '''
-        Extract Embedding for given descriptors
-        '''
-        embedding_words = []
-
-        for word in descriptors.values():
-            if word and word not in embedding_words:
-                embedding_words.append(word)
-
-        embedding_str = '|'.join(embedding_words)
-
+    def _generate_embedding(self, tag: str, client, desc: dict) -> dict:
+        unique_terms = list({v for v in desc.values() if v})
+        joined_text = "|".join(unique_terms)
         try:
-            response = client.embeddings.create(
-                input=embedding_str, model=self.__embedding_model)
-        except Exception as error:
-            self.__logger.error(f'{log_str} | openai_error |', exc_info=True)
-            raise error
+            response = client.embeddings.create(input=joined_text, model=self._embed_model)
+        except Exception as err:
+            self._log.critical(f"{tag} | openai_embedding_error", exc_info=True)
+            raise err
 
-        self.__logger.info(f'{log_str} | embeddings_extracted')
+        self._prompt_tokens += response.usage.prompt_tokens
+        self._total_tokens += response.usage.total_tokens
+        self._used_model += response.model
 
-        self.__prompt_tokens += response.usage.prompt_tokens
-        self.__total_tokens += response.usage.total_tokens
-        self.__model += response.model
-
-        data = {
-            'vector': response.data[0].embedding,
-            'prompt_tokens': response.usage.prompt_tokens,
-            'completion_tokens': 0,
-            'total_tokens': response.usage.total_tokens,
-            'model': response.model
+        return {
+            "vector": response.data[0].embedding,
+            "prompt_tokens": response.usage.prompt_tokens,
+            "completion_tokens": 0,
+            "total_tokens": response.usage.total_tokens,
+            "model": response.model,
         }
 
-        return data
-
-    def get_shortlisted_items_table(self, result: list,
-                                    target_descriptors: str) -> str:
-        '''
-        Get short list items and return table items 
-        '''
-        shortlisted_dresses = []
-        urls = set()
-
-        for row in result:
-            url = row['url']
-            name = row['name']
-
-            if url in urls:
-                continue
-
-            urls.add(url)
-            shortlisted_dress = {'name': name, 'url': url}
-
-            fashion_description = i if (i := row.get(
-                'furnitureDescriptors')) else row.get('fashion_descriptor')
-
-            for key, value in json.loads(fashion_description).items():
-                shortlisted_dress[key] = value
-
-            shortlisted_dresses.append(shortlisted_dress)
-
-            if len(shortlisted_dresses) >= self.__max_shortlist_count:
-                break
-
-        return [target_descriptors] + shortlisted_dresses
-
-    def get_weaviate_query_results(self, message: ChatMessage,
-                                   image_descriptors: dict) -> list:
-        '''
-        Retrieve matching data from Weaviate
-        '''
+    def _fetch_weaviate_results(self, chat_message: ChatMessage, desc: dict) -> list:
         try:
-            weaviate_services = WeaviateServices()
-            results = weaviate_services.data_retrieve(
-                message.organization.name, json.dumps(image_descriptors), True
-            )
-            shortlisted_items = self.get_shortlisted_items_table(
-                results, image_descriptors)
-            return shortlisted_items
-
+            db = WeaviateHandler()
+            result = db.query_data(chat_message.organization.name, json.dumps(desc), True)
+            return self._create_shortlist_table(result, desc)
         except Exception:
-            self.__logger.error(
-                'weaviate data retrieve failed error', exc_info=True)
+            self._log.critical("weaviate_query_failed", exc_info=True)
             raise
 
+    def _create_shortlist_table(self, query_results: list, target: dict) -> list:
+        shortlist = []
+        seen_urls = set()
+        for row in query_results:
+            url = row.get("url")
+            name = row.get("name")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            entry = {"name": name, "url": url}
+            desc_field = row.get("furnitureDescriptors") or row.get("furniture_descriptor")
+            if desc_field:
+                for k, v in json.loads(desc_field).items():
+                    entry[k] = v
+
+            shortlist.append(entry)
+            if len(shortlist) >= self._shortlist_cap:
+                break
+
+        return [target] + shortlist
+
     @log_execution_time
-    def match_images(self, client, message: ChatMessage) -> str:
-        '''
-        Match images and retrieve shortlisted items.
-        '''
-        log_str = (f'[{message.request_id}] | [{message.organization.id}] | '
-                   f'[{message.session_id}]')
+    def run_image_match(self, client, chat_message: ChatMessage) -> str:
+        tag = f"[{chat_message.request_id}] | [{chat_message.organization.id}] | [{chat_message.session_id}]"
+        desc = asyncio.run(self._prepare_and_describe(tag, client, chat_message, is_chat=True))
+        embedding_vector = self._generate_embedding(tag, client, desc).get("vector")
+        shortlist = self._fetch_weaviate_results(chat_message, desc)
+        result_table = tabulate(shortlist, headers="keys", tablefmt="github")
+        return result_table
 
-        image_descriptors = asyncio.run(
-            self.preprocess_n_get_image_description(
-                log_str, client, message, is_chat=True))
-
-        embedding = self.get_embedding(
-            log_str, client, image_descriptors).get('vector')
-
-        shortlisted_results = self.get_weaviate_query_results(
-                message, image_descriptors)
-
-        shortlisted_table = tabulate(
-            shortlisted_results, headers='keys', tablefmt='github')
-
-        self.__logger.info(f'[{message.request_id}] - [{message.organization_id}] | '
-                           f'[{message.session_id}] | shortlisted_results_fetched')
-
-        return shortlisted_table
-
-    async def preprocess_n_get_image_description(self, log_str: str, client,
-                                                 message: ChatMessage,
-                                                 is_chat: bool = False) -> dict:
-        '''
-        Preprocess and retrieve image description.
-        '''
-        filename = self.download_image(message)
-        if is_chat:
-            resized_image_filename = self.resize_image(log_str, filename)
-        else:
-            resized_image_filename = self.resize_image(log_str, filename,
-                                                       (365, 365))
-
-        image_descriptors = self.get_image_descriptors(
-            log_str, client, resized_image_filename)
-
-        return image_descriptors
+    async def _prepare_and_describe(self, tag: str, client, chat_message: ChatMessage, is_chat: bool = False) -> dict:
+        img_name = self._download(chat_message)
+        resized = self._resize(tag, img_name, (365, 365) if not is_chat else None)
+        return self._describe_image(tag, client, resized)
